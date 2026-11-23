@@ -41,6 +41,8 @@ def api_get(path, params):
     r = requests.get(f"{BASE}/{path}", params=params, headers=HEADERS,
                      impersonate="chrome", timeout=30)
     if r.status_code in (403, 429):
+        print(f"DEBUG status={r.status_code} cf-mitigated={r.headers.get('cf-mitigated')} server={r.headers.get('server')}", file=sys.stderr)
+        print(f"DEBUG body={r.text[:300]!r}", file=sys.stderr)
         raise BlockedError(f"HTTP {r.status_code}")
     r.raise_for_status()
     body = r.json()
