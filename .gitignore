@@ -1,0 +1,5 @@
+webhook.txt
+state.json
+watcher.log
+watcher.log.tmp
+__pycache__/
