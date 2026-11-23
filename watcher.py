@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""CGV 광교 IMAX 새 상영 감지 -> Discord 알림 (GitHub Actions용)"""
+"""CGV 광교 IMAX 새 상영 감지 -> Discord 알림
+안드로이드(Termux)나 집 PC에서 돌리는 버전. 외부 라이브러리 설치가 필요 없습니다."""
 
 import json
 import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
-from curl_cffi import requests
+try:  # 설치돼 있으면 쓰고, 없어도 괜찮음
+    from curl_cffi import requests as cffi_requests
+except Exception:
+    cffi_requests = None
 
 # ================= 설정 (여기만 고치면 됩니다) =================
 SITE_NO = "0257"                 # CGV 광교 극장 코드
@@ -22,15 +28,19 @@ REQUEST_DELAY = 0.7              # 날짜별 요청 사이 대기(초)
 ERROR_ALERT_COOLDOWN_HOURS = 12  # 오류 알림 최소 간격(시간)
 # ==============================================================
 
-KST = ZoneInfo("Asia/Seoul")
+KST = timezone(timedelta(hours=9))  # 한국 시간 (서머타임 없음)
 BASE = "https://cgv.co.kr/api/v1"
 CO_CD = "A420"
 BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
+CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 HEADERS = {
     "Referer": "https://cgv.co.kr/cnm/movieBook/cinema",
     "Accept": "application/json",
 }
-STATE_PATH = Path(__file__).resolve().parent / "state.json"
+HERE = Path(__file__).resolve().parent
+STATE_PATH = HERE / "state.json"
+WEBHOOK_PATH = HERE / "webhook.txt"
 
 
 class BlockedError(Exception):
@@ -38,14 +48,22 @@ class BlockedError(Exception):
 
 
 def api_get(path, params):
-    r = requests.get(f"{BASE}/{path}", params=params, headers=HEADERS,
-                     impersonate="chrome", timeout=30)
-    if r.status_code in (403, 429):
-        print(f"DEBUG status={r.status_code} cf-mitigated={r.headers.get('cf-mitigated')} server={r.headers.get('server')}", file=sys.stderr)
-        print(f"DEBUG body={r.text[:300]!r}", file=sys.stderr)
-        raise BlockedError(f"HTTP {r.status_code}")
-    r.raise_for_status()
-    body = r.json()
+    url = f"{BASE}/{path}?{urlencode(params)}"
+    if cffi_requests:
+        r = cffi_requests.get(url, headers=HEADERS, impersonate="chrome", timeout=30)
+        status, text = r.status_code, r.text
+    else:
+        req = urllib.request.Request(url, headers={**HEADERS, "User-Agent": CHROME_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status, text = resp.status, resp.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            status, text = e.code, e.read().decode("utf-8", "ignore")
+    if status in (403, 429):
+        raise BlockedError(f"HTTP {status}")
+    if status >= 400:
+        raise RuntimeError(f"HTTP {status}")
+    body = json.loads(text)
     if body.get("statusCode") not in (0, None):
         raise RuntimeError(f"API 오류 {body.get('statusCode')}: {body.get('statusMessage')}")
     data = body.get("data")
@@ -98,19 +116,26 @@ def fmt_time(hhmm):
 
 # ---------------- Discord ----------------
 def discord_send(webhook, payload):
+    data = json.dumps(payload).encode("utf-8")
     for _ in range(3):
-        r = requests.post(webhook, json=payload, timeout=30,
-                          headers={"User-Agent": "DiscordBot (cgv-imax-watch, 1.0)"})
-        if r.status_code == 429:
-            try:
-                wait = float(r.json().get("retry_after", 2))
-            except Exception:
-                wait = 2
-            time.sleep(min(wait, 10) + 0.5)
-            continue
-        if r.status_code >= 300:
-            raise RuntimeError(f"Discord 전송 실패 HTTP {r.status_code}: {r.text[:200]}")
-        return
+        req = urllib.request.Request(webhook, data=data, method="POST", headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (cgv-imax-watch, 1.0)",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+                return
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", "ignore")
+            if e.code == 429:
+                try:
+                    wait = float(json.loads(text).get("retry_after", 2))
+                except Exception:
+                    wait = 2
+                time.sleep(min(wait, 10) + 0.5)
+                continue
+            raise RuntimeError(f"Discord 전송 실패 HTTP {e.code}: {text[:200]}")
     raise RuntimeError("Discord 전송 실패: 요청 제한(429)이 계속됨")
 
 
@@ -177,10 +202,18 @@ def report_error(webhook, state, now, message):
         print(f"오류 알림 전송도 실패: {e}", file=sys.stderr)
 
 
+def read_webhook():
+    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if not url and WEBHOOK_PATH.exists():
+        url = WEBHOOK_PATH.read_text(encoding="utf-8").strip()
+    return url
+
+
 def main():
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    webhook = read_webhook()
     if not webhook:
-        print("ERROR: DISCORD_WEBHOOK_URL 이 설정되지 않았습니다.", file=sys.stderr)
+        print("ERROR: 웹훅 주소가 없습니다. webhook.txt 파일에 Discord 웹훅 주소를 넣어주세요.",
+              file=sys.stderr)
         return 1
 
     now = datetime.now(KST)                    # 항상 한국 시간 기준
@@ -201,7 +234,7 @@ def main():
             time.sleep(REQUEST_DELAY)
     except BlockedError as e:
         report_error(webhook, state, now,
-                     f"CGV가 접속을 막았습니다({e}). GitHub 서버 IP가 차단된 것일 수 있어요.")
+                     f"CGV가 접속을 막았습니다({e}). 지금 쓰는 인터넷(IP)이 차단됐을 수 있어요.")
         save_state(state, notified, today)
         return 0
     except Exception as e:
@@ -211,30 +244,35 @@ def main():
 
     new_hits = [s for s in hits if show_key(s) not in notified]
     print(f"[{now:%Y-%m-%d %H:%M} KST] 극장={site_name or '?'} 열린날짜={len(dates)} "
-          f"전체회차={total} IMAX={len(hits)} 신규={len(new_hits)}")
+          f"전체회차={total} IMAX={len(hits)} 신규={len(new_hits)}", flush=True)
 
-    if not state.get("initialized"):
-        if NOTIFY_ON_FIRST_RUN and new_hits:
-            send_new_shows(webhook, new_hits)
-        discord_send(webhook, {"content": (
-            f"✅ **{SITE_LABEL} IMAX 감시 시작**\n"
-            f"확인된 극장명: `{site_name or '데이터 없음'}` (코드 {SITE_NO})\n"
-            f"현재 열린 날짜 {len(dates)}일 / 전체 {total}회차 / IMAX {len(hits)}회차\n"
-            + ("이미 열린 IMAX 회차를 방금 알렸습니다." if NOTIFY_ON_FIRST_RUN
-               else "이미 열린 IMAX 회차는 조용히 기록했고, 앞으로 **새로 열리는 것만** 알려드립니다.")
-        )})
-        notified.update(show_key(s) for s in hits)
-        state["initialized"] = True
-    else:
-        if new_hits:
-            send_new_shows(webhook, new_hits)       # 실패하면 예외 -> 기록 안 함 -> 다음에 재시도
-            notified.update(show_key(s) for s in new_hits)
-        if state.get("last_error_alert"):
-            try:
-                discord_send(webhook, {"content": f"✅ CGV 감시가 정상으로 복구됐습니다. ({SITE_LABEL})"})
-                state["last_error_alert"] = ""
-            except Exception:
-                pass
+    try:
+        if not state.get("initialized"):
+            if NOTIFY_ON_FIRST_RUN and new_hits:
+                send_new_shows(webhook, new_hits)
+            discord_send(webhook, {"content": (
+                f"✅ **{SITE_LABEL} IMAX 감시 시작**\n"
+                f"확인된 극장명: `{site_name or '데이터 없음'}` (코드 {SITE_NO})\n"
+                f"현재 열린 날짜 {len(dates)}일 / 전체 {total}회차 / IMAX {len(hits)}회차\n"
+                + ("이미 열린 IMAX 회차를 방금 알렸습니다." if NOTIFY_ON_FIRST_RUN
+                   else "이미 열린 IMAX 회차는 조용히 기록했고, 앞으로 **새로 열리는 것만** 알려드립니다.")
+            )})
+            notified.update(show_key(s) for s in hits)
+            state["initialized"] = True
+        else:
+            if new_hits:
+                send_new_shows(webhook, new_hits)   # 실패하면 기록 안 함 -> 다음에 재시도
+                notified.update(show_key(s) for s in new_hits)
+            if state.get("last_error_alert"):
+                try:
+                    discord_send(webhook, {"content": f"✅ CGV 감시가 정상으로 복구됐습니다. ({SITE_LABEL})"})
+                    state["last_error_alert"] = ""
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"ERROR: Discord 전송 실패, 다음 실행 때 다시 시도합니다: {e}", file=sys.stderr)
+        save_state(state, set(state.get("notified", [])), today)
+        return 0
 
     save_state(state, notified, today)
     return 0
