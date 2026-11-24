@@ -24,6 +24,7 @@ SITE_LABEL = "CGV 광교"          # 알림에 표시할 이름
 SCREEN_KEYWORDS = ["IMAX"]       # 상영관/포맷 이름에 이 글자가 있으면 감지
 NOTIFY_ON_FIRST_RUN = False      # 첫 실행 때 이미 열려있는 회차도 알릴지 (False=조용히 기록만)
 SKIP_STARTED_TODAY = True        # 오늘 이미 시작한 회차는 제외
+SHOW_TIMES = False               # True로 바꾸면 알림에 상영 시각(⏰)도 표시
 REQUEST_DELAY = 0.7              # 날짜별 요청 사이 대기(초)
 ERROR_ALERT_COOLDOWN_HOURS = 12  # 오류 알림 최소 간격(시간)
 # ==============================================================
@@ -139,36 +140,35 @@ def discord_send(webhook, payload):
     raise RuntimeError("Discord 전송 실패: 요청 제한(429)이 계속됨")
 
 
+def fmt_date_long(ymd):
+    return f"{ymd[:4]}년 {ymd[4:6]}월 {ymd[6:]}일"
+
+
 def send_new_shows(webhook, shows):
-    groups = {}
+    blocks = {}
     for s in shows:
         title = s.get("expoProdNm") or s.get("prodNm") or "제목 미상"
-        screen = s.get("expoScnsNm") or s.get("scnsNm") or ""
-        fmt = s.get("movkndDsplNm") or ""
-        groups.setdefault((title, screen, fmt), {}).setdefault(str(s.get("scnYmd")), []).append(s)
+        screen = s.get("expoScnsNm") or s.get("scnsNm") or s.get("movkndDsplNm") or "IMAX관"
+        blocks.setdefault((title, str(s.get("scnYmd")), screen), []).append(s)
 
-    embeds = []
-    for (title, screen, fmt), by_date in sorted(groups.items()):
-        lines = []
-        for ymd in sorted(by_date):
-            items = sorted(by_date[ymd], key=start_hhmm)
-            times = " · ".join(
-                f"`{fmt_time(start_hhmm(s))}` ({s.get('frSeatCnt', '?')}/{s.get('stcnt', '?')})"
-                for s in items)
-            lines.append(f"**{fmt_date(ymd)}**  {times}")
-        embeds.append({
-            "title": f"🎬 {title}"[:250],
-            "url": BOOKING_URL,
-            "description": ("\n".join(lines))[:4000],
-            "color": 0x00A0E9,
-            "footer": {"text": f"{SITE_LABEL} · {screen or fmt} · (잔여/전체 좌석)"[:2000]},
-        })
+    texts = []
+    for (title, ymd, screen), items in sorted(blocks.items()):
+        t = f"🎬 {title}\n📅 {fmt_date_long(ymd)}\n🎥 {screen}"
+        if SHOW_TIMES:
+            times = ", ".join(fmt_time(start_hhmm(x)) for x in sorted(items, key=start_hhmm))
+            t += f"\n⏰ {times}"
+        texts.append(t)
 
-    for i in range(0, len(embeds), 10):  # 디스코드는 한 번에 embed 10개까지
-        discord_send(webhook, {
-            "content": f"🚨 **{SITE_LABEL} IMAX 새 상영 감지!**  [예매하러 가기]({BOOKING_URL})",
-            "embeds": embeds[i:i + 10],
-        })
+    header = f"🎥 {SITE_LABEL} IMAX 예매 오픈!\n\n새로운 IMAX 상영이 발견되었습니다.\n\n"
+    footer = (f"🔔 {SITE_LABEL}에서 예매 가능한 IMAX 상영이 새로 열렸습니다!"
+
+    current = header
+    for t in texts:
+        if len(current) + len(t) + len(footer) + 4 > 1900 and current != header:
+            discord_send(webhook, {"content": current + footer})   # 디스코드 글자수 제한 때문에 나눠서 전송
+            current = header
+        current += t + "\n\n"
+    discord_send(webhook, {"content": current + footer})
 
 
 # ---------------- 상태 저장 ----------------
