@@ -1,3 +1,4 @@
+cat > watcher.py << 'EOF'
 #!/usr/bin/env python3
 """CGV 광교 IMAX 새 상영 감지 -> Discord 알림
 안드로이드(Termux)나 집 PC에서 돌리는 버전. 외부 라이브러리 설치가 필요 없습니다."""
@@ -106,13 +107,12 @@ def show_key(show):
     return "|".join(str(show.get(k, "")) for k in ("scnYmd", "scnsNo", "prodNo", "scnsrtTm"))
 
 
-def fmt_date(ymd):
-    dt = datetime.strptime(ymd, "%Y%m%d")
-    return f"{dt.month}/{dt.day}({'월화수목금토일'[dt.weekday()]})"
-
-
 def fmt_time(hhmm):
     return f"{hhmm[:2]}:{hhmm[2:]}" if len(hhmm) >= 4 else hhmm
+
+
+def fmt_date_long(ymd):
+    return f"{ymd[:4]}년 {ymd[4:6]}월 {ymd[6:]}일"
 
 
 # ---------------- Discord ----------------
@@ -140,10 +140,6 @@ def discord_send(webhook, payload):
     raise RuntimeError("Discord 전송 실패: 요청 제한(429)이 계속됨")
 
 
-def fmt_date_long(ymd):
-    return f"{ymd[:4]}년 {ymd[4:6]}월 {ymd[6:]}일"
-
-
 def send_new_shows(webhook, shows):
     blocks = {}
     for s in shows:
@@ -160,7 +156,7 @@ def send_new_shows(webhook, shows):
         texts.append(t)
 
     header = f"🎥 {SITE_LABEL} IMAX 예매 오픈!\n\n새로운 IMAX 상영이 발견되었습니다.\n\n"
-    footer = (f"🔔 {SITE_LABEL}에서 예매 가능한 IMAX 상영이 새로 열렸습니다!"
+    footer = f"🔔 {SITE_LABEL}에서 예매 가능한 IMAX 상영이 새로 열렸습니다!"
 
     current = header
     for t in texts:
@@ -280,3 +276,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+EOF
